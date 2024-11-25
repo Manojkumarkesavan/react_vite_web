@@ -1,16 +1,16 @@
-const WebSocket = require("ws");
+// const WebSocket = require("ws");
 
-const wss = new WebSocket.Server({ port: 3000 });
+// const wss = new WebSocket.Server({ port: 3000 });
 
-wss.on("connection", function connection(ws) {
-  ws.on("message", function incoming(message) {
-    // Broadcast received message to all clients except the sender
-    wss.clients.forEach(function each(client) {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(message);
-      }
-    });
-  });
-});
+// wss.on("connection", function connection(ws) {
+//   ws.on("message", function incoming(message) {
+//     // Broadcast received message to all clients except the sender
+//     wss.clients.forEach(function each(client) {
+//       if (client !== ws && client.readyState === WebSocket.OPEN) {
+//         client.send(message);
+//       }
+//     });
+//   });
+// });
 
-console.log("Signaling server running on ws://localhost:3000");
+// console.log("Signaling server running on ws://localhost:3000");
