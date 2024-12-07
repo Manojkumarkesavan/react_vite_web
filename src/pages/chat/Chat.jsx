@@ -1,75 +1,115 @@
 // Chat.jsx
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import io from "socket.io-client";
+import Notification from "../../components/Notification"; // Adjust the path if needed
+import notificationSound from "../../assets/sounds/notification.mp3";
+import axios from "axios";
+import debounce from "lodash.debounce";
 import Picker from "@emoji-mart/react";
 import data from "@emoji-mart/data";
-import axios from "axios";
-import UserService from "../../Service/UserService.jsx";
-import debounce from "lodash.debounce";
+import UserService from "../../Service/UserService";
 import BeginChatSvg from "../../assets/images/svg/begin_chat.svg";
-import SockJS from "sockjs-client";
-import Stomp from "stompjs";
 
 const Chat = () => {
-  const [isCalling, setIsCalling] = useState(false);
+  // State Variables
+  const [chatList, setChatList] = useState([]);
+  const [activeChat, setActiveChat] = useState(null);
   const [messages, setMessages] = useState([]);
   const [inputValue, setInputValue] = useState("");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
   const [isTyping, setIsTyping] = useState(false);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
-  const [notificationSound, setNotificationSound] = useState(true);
-  const [callStatus, setCallStatus] = useState("idle");
-  const [isVideoCall, setIsVideoCall] = useState(false);
-  const [peerConnection, setPeerConnection] = useState(null);
-  const [localStream, setLocalStream] = useState(null);
-  const [remoteStream, setRemoteStream] = useState(null);
+  const [isCalling, setIsCalling] = useState(false);
+
+  // Refs
+  const socketRef = useRef(null);
+  const messagesEndRef = useRef(null);
   const typingTimeoutRef = useRef(null);
   const emojiPickerRef = useRef(null);
-  const [activeChat, setActiveChat] = useState(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const chatListRef = useRef(chatList);
+  const userIdRef = useRef(null);
 
-  const messagesEndRef = useRef(null);
-  const messagesContainerRef = useRef(null);
-  const [chatList, setChatList] = useState([]);
-  const [searchTerm, setSearchTerm] = useState("");
-  const [results, setResults] = useState([]);
+  // Notification State
+  const [notification, setNotification] = useState({
+    message: "",
+    visible: false,
+  });
+
+  const audioRef = useRef(new Audio(notificationSound));
+
+  // Constants
+  const SOCKET_SERVER_URL = "http://localhost:3000";
   axios.defaults.baseURL = "http://localhost:8088";
 
-  /* Onload UseEffect to Fetch Conversations */
+  // Retrieve User Data
+  const userData = JSON.parse(localStorage.getItem("response_data"));
+  const userId = userData?.users?.id;
+  userIdRef.current = userId;
+
+  // Function to Show Notification
+  const showNotification = (message) => {
+    setNotification({ message, visible: true });
+  };
+
+  // Function to Hide Notification
+  const hideNotification = () => {
+    setNotification({ message: "", visible: false });
+  };
+
+  // Update chatListRef Whenever chatList Changes
+  useEffect(() => {
+    chatListRef.current = chatList;
+  }, [chatList]);
+
+  // Fetch Conversations on Mount
   useEffect(() => {
     const fetchConversations = async () => {
       const token = localStorage.getItem("access_token");
-      const userId = JSON.parse(localStorage.getItem("response_data")).users.id;
 
       try {
         const response = await UserService.getConversation(userId, token);
 
-        // Map conversations to chatList format
+        // Fetch Unread Message Counts
+        const unreadCountsResponse = await axios.get(
+          `/api/users/${userId}/unread-counts`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          },
+        );
+        const unreadCounts = unreadCountsResponse.data;
+
         const conversations = await Promise.all(
           response.data.map(async (conv) => {
             const otherUserId = conv.user1 === userId ? conv.user2 : conv.user1;
-            // Fetch the other user's details
             const userResponse = await UserService.getUserById(
               otherUserId,
               token,
             );
             const otherUser = userResponse.data;
 
-            const lastMessage =
-              conv.messages && conv.messages.length
-                ? conv.messages[conv.messages.length - 1]
-                : null;
+            const lastMessage = conv.messages?.length
+              ? conv.messages[conv.messages.length - 1]
+              : null;
 
             return {
               id: conv.id,
               name: `${otherUser.firstName} ${otherUser.lastName}`,
-              lastMessage: lastMessage ? lastMessage.content : "",
+              lastMessage: lastMessage?.content || "",
               time: lastMessage
                 ? new Date(lastMessage.timestamp).toLocaleTimeString([], {
                     hour: "2-digit",
                     minute: "2-digit",
                   })
                 : "",
-              online: otherUser.online || false, // Update as per your logic
+              online: otherUser.online || false,
               otherUserId,
+              unreadCount: unreadCounts[conv.id.toString()] || 0,
             };
           }),
         );
@@ -81,9 +121,9 @@ const Chat = () => {
     };
 
     fetchConversations();
-  }, []);
+  }, [userId]);
 
-  /* UseEffect to Fetch Messages When Active Chat Changes */
+  // Fetch Messages When Active Chat Changes
   useEffect(() => {
     const fetchMessages = async () => {
       if (activeChat) {
@@ -102,16 +142,105 @@ const Chat = () => {
     fetchMessages();
   }, [activeChat]);
 
-  /* Scroll to Bottom When Messages Change */
+  // Scroll to Bottom When Messages Change
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({
-      behavior: "smooth",
-      block: "end",
-      inline: "nearest",
-    });
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  /* Handle Input Change */
+  // Initialize Socket.IO Client
+  useEffect(() => {
+    socketRef.current = io(SOCKET_SERVER_URL);
+
+    socketRef.current.on("connect", () => {
+      console.log("Connected to Socket.IO server");
+    });
+
+    // Handle Receiving a Message
+    socketRef.current.on("receive-message", (message) => {
+      setMessages((prevMessages) => [...prevMessages, message]);
+
+      if (message.sender !== userIdRef.current) {
+        audioRef.current.play();
+
+        // Find the Sender's Name
+        const senderName =
+          chatListRef.current.find(
+            (chat) => chat.otherUserId === message.sender,
+          )?.name || "a user";
+
+        // Show the Notification
+        showNotification(`New message from ${senderName}`);
+
+        // Update Unread Count for the Conversation
+        setChatList((prevChatList) =>
+          prevChatList.map((chat) =>
+            chat.id === message.conversation.id
+              ? { ...chat, unreadCount: (chat.unreadCount || 0) + 1 }
+              : chat,
+          ),
+        );
+      }
+
+      // Send Acknowledgment Back to the Server
+      socketRef.current.emit("message-delivered", {
+        messageId: message.id,
+        conversationId: message.conversation.id,
+      });
+    });
+
+    // Handle Message Sent Acknowledgment
+    socketRef.current.on("message-sent", ({ tempId, message }) => {
+      // Update the Message in the Messages Array
+      setMessages((prevMessages) =>
+        prevMessages.map((msg) =>
+          msg.tempId === tempId ? { ...message, status: "SENT" } : msg,
+        ),
+      );
+    });
+
+    // Handle Message Status Updates
+    socketRef.current.on("message-status-updated", ({ messageId, status }) => {
+      setMessages((prevMessages) =>
+        prevMessages.map((msg) =>
+          Number(msg.id) === Number(messageId) ? { ...msg, status } : msg,
+        ),
+      );
+    });
+
+    socketRef.current.on("error", (error) => {
+      console.error("Error from server:", error.message);
+    });
+
+    return () => {
+      socketRef.current.off("receive-message");
+      socketRef.current.off("message-sent");
+      socketRef.current.off("message-status-updated");
+      socketRef.current.off("error");
+      socketRef.current.disconnect();
+    };
+  }, []); // Empty dependency array
+
+  // Join Room When Active Chat Changes
+  useEffect(() => {
+    if (activeChat && socketRef.current) {
+      const roomId = String(activeChat);
+      socketRef.current.emit("join", { conversationId: roomId });
+      console.log(`Joined room ${roomId}`);
+    }
+  }, [activeChat]);
+
+  // Reset Unread Count When Active Chat Changes
+  useEffect(() => {
+    if (activeChat) {
+      setChatList((prevChatList) =>
+        prevChatList.map((chat) =>
+          chat.id === activeChat ? { ...chat, unreadCount: 0 } : chat,
+        ),
+      );
+    }
+  }, [activeChat]);
+
+  // Handle Input Change
   const handleInputChange = (e) => {
     setInputValue(e.target.value);
     setIsTyping(true);
@@ -123,187 +252,77 @@ const Chat = () => {
     }, 1000);
   };
 
-  /* Handle Sending a Message */
-  const handleSendMessage = async () => {
+  // Handle Sending a Message
+  const handleSendMessage = () => {
     if (!inputValue.trim()) return;
 
-    const token = localStorage.getItem("access_token");
-    const senderId = JSON.parse(localStorage.getItem("response_data")).users.id;
     const receiverId = chatList.find(
       (chat) => chat.id === activeChat,
     )?.otherUserId;
 
+    if (!receiverId) {
+      console.error("Receiver ID not found");
+      return;
+    }
+
+    const tempId = "temp-" + new Date().getTime();
+
     const newMessage = {
+      tempId,
       content: inputValue,
-      sender: senderId,
+      sender: userId,
       receiver: receiverId,
       timestamp: new Date().toISOString(),
       conversation: { id: activeChat },
-      status: "sending",
+      status: "SENDING",
     };
 
     setInputValue("");
-    const tempId = "temp-" + new Date().getTime();
-    setMessages((prevMessages) => [
-      ...prevMessages,
-      { ...newMessage, id: tempId, status: "sending" },
-    ]);
-
-    // Update chatList with the latest message
-    setChatList((prevChatList) =>
-      prevChatList.map((chat) =>
-        chat.id === activeChat
-          ? {
-              ...chat,
-              lastMessage: newMessage.content,
-              time: new Date(newMessage.timestamp).toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-              }),
-            }
-          : chat,
-      ),
-    );
+    setMessages((prevMessages) => [...prevMessages, newMessage]);
 
     try {
-      const response = await UserService.sendMessage(newMessage, token);
-      // Update the message ID and status
-      updateMessageStatus(messages.length - 1, "sent", response.data.id);
+      // Emit the Message to the Server
+      socketRef.current.emit("send-message", newMessage);
     } catch (error) {
       console.error("Error sending message:", error);
-      //updateMessageStatus(messages.length - 1, "failed");
-      updateMessageStatus(tempId, "failed");
+      // Update the Message Status to 'FAILED'
+      setMessages((prevMessages) =>
+        prevMessages.map((msg) =>
+          msg.tempId === tempId ? { ...msg, status: "FAILED" } : msg,
+        ),
+      );
     }
   };
 
-  /* Update Message Status */
-  const updateMessageStatus = (index, status, messageId = null) => {
-    setMessages((prevMessages) => {
-      const updatedMessages = [...prevMessages];
-      if (updatedMessages[index]) {
-        updatedMessages[index].status = status;
-        if (messageId) {
-          updatedMessages[index].id = messageId;
-        }
-      }
-      return updatedMessages;
-    });
-  };
-
-  // h-[calc(88vh-2rem)]
-
-  /* WebRTC Functions (unchanged) */
-  const signalingServerRef = useRef(null);
-  const localVideoRef = useRef(null);
-  const remoteVideoRef = useRef(null);
-  const peerConnectionRef = useRef(null);
-
-  /* WebRTC Functions */
+  // Handle Read Receipts
   useEffect(() => {
-    signalingServerRef.current = new WebSocket("ws://localhost:3000");
-
-    signalingServerRef.current.onmessage = async (message) => {
-      const data = JSON.parse(message.data);
-
-      if (data.answer) {
-        await peerConnectionRef.current.setRemoteDescription(
-          new RTCSessionDescription(data.answer),
-        );
-      } else if (data.offer) {
-        console.log("offer :" + data.offer);
-        if (!peerConnectionRef.current) createPeerConnection();
-
-        await peerConnectionRef.current.setRemoteDescription(
-          new RTCSessionDescription(data.offer),
-        );
-        const answer = await peerConnectionRef.current.createAnswer();
-        await peerConnectionRef.current.setLocalDescription(answer);
-        signalingServerRef.current.send(JSON.stringify({ answer }));
-      } else if (data.iceCandidate) {
-        try {
-          await peerConnectionRef.current.addIceCandidate(data.iceCandidate);
-        } catch (e) {
-          console.error("Error adding received ice candidate", e);
-        }
-      }
-    };
-
-    return () => signalingServerRef.current.close();
-  }, []);
-
-  const createPeerConnection = () => {
-    peerConnectionRef.current = new RTCPeerConnection({
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-    });
-
-    peerConnectionRef.current.onicecandidate = (event) => {
-      if (event.candidate) {
-        signalingServerRef.current.send(
-          JSON.stringify({ iceCandidate: event.candidate }),
-        );
-      }
-    };
-
-    peerConnectionRef.current.ontrack = (event) => {
-      remoteVideoRef.current.srcObject = event.streams[0];
-    };
-  };
-
-  const handleStartCall = async () => {
-    setIsCalling(true);
-    createPeerConnection();
-
-    const localStream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true,
-    });
-    localStream
-      .getTracks()
-      .forEach((track) =>
-        peerConnectionRef.current.addTrack(track, localStream),
+    if (activeChat && messages.length > 0) {
+      const unreadMessages = messages.filter(
+        (msg) => msg.sender !== userId && msg.status !== "READ",
       );
-    localVideoRef.current.srcObject = localStream;
 
-    const offer = await peerConnectionRef.current.createOffer();
-    await peerConnectionRef.current.setLocalDescription(offer);
+      unreadMessages.forEach((msg) => {
+        socketRef.current.emit("message-read", {
+          messageId: msg.id,
+          conversationId: activeChat,
+        });
+      });
+    }
+  }, [activeChat, messages]);
 
-    signalingServerRef.current.send(JSON.stringify({ offer }));
-  };
-
-  const handleVideoCall = () => {
-    // Placeholder for video call logic
-    console.log("Initiating video call...");
-    setIsCalling(true);
-    // Implement actual call logic here
-  };
-
-  const handleEndCall = () => {
-    setIsCalling(false);
-    peerConnectionRef.current.close();
-    peerConnectionRef.current = null;
-    localVideoRef.current.srcObject
-      .getTracks()
-      .forEach((track) => track.stop());
-    remoteVideoRef.current.srcObject = null;
-  };
-
-  /* search users */
-
+  // Fetch Users (Search)
   const fetchUsers = useCallback(async (query) => {
     const token = localStorage.getItem("access_token");
     try {
       const response = await UserService.search({ query }, token);
-      setResults(response.data || []);
+      setSearchResults(response.data || []);
     } catch (error) {
       console.error("Error fetching users:", error);
     }
   }, []);
 
   const debouncedFetchUsers = useMemo(
-    () =>
-      debounce((query) => {
-        fetchUsers(query);
-      }, 300),
+    () => debounce((query) => fetchUsers(query), 300),
     [fetchUsers],
   );
 
@@ -311,28 +330,24 @@ const Chat = () => {
     if (searchTerm) {
       debouncedFetchUsers(searchTerm);
     } else {
-      setResults([]);
+      setSearchResults([]);
     }
-    // Cleanup function to cancel debounce on unmount
     return () => {
       debouncedFetchUsers.cancel();
     };
   }, [searchTerm, debouncedFetchUsers]);
 
-  /* Start Chat with a User */
+  // Start Chat with a User
   const startChatWithUser = async (user) => {
     const token = localStorage.getItem("access_token");
-    const currentUserId = JSON.parse(localStorage.getItem("response_data"))
-      .users.id;
     try {
       const response = await UserService.startConversation(
-        currentUserId,
+        userId,
         user.id,
         token,
       );
 
       const conversation = response.data;
-      // Add the conversation to the chat list if it's a new one
       if (!chatList.find((chat) => chat.id === conversation.id)) {
         setChatList((prevChatList) => [
           {
@@ -340,60 +355,58 @@ const Chat = () => {
             name: `${user.firstName} ${user.lastName}`,
             lastMessage: "",
             time: "",
-            online: user.online || false, // Assuming you have this info
+            online: user.online || false,
             otherUserId: user.id,
+            unreadCount: 0,
           },
           ...prevChatList,
         ]);
       }
 
-      // Set the active chat
       setActiveChat(conversation.id);
-
-      // Clear search
       setSearchTerm("");
-      setResults([]);
+      setSearchResults([]);
     } catch (error) {
       console.error("Error starting chat with user:", error);
     }
   };
 
-  const stompClient = useRef(null);
-  useEffect(() => {
-    const connectWebSocket = () => {
-      const sock = new SockJS("http://localhost:8088/ws");
-      stompClient.current = Stomp.over(sock);
-      stompClient.current.connect({}, () => {
-        console.log("Connected to WebSocket");
-        if (activeChat) {
-          stompClient.current.subscribe(
-            `/topic/messages/${activeChat}`,
-            (message) => {
-              const newMessage = JSON.parse(message.body);
-              setMessages((prevMessages) => [...prevMessages, newMessage]);
-            }
-          );
-        }
-      });
-    };
-  
-    connectWebSocket();
-  
-    return () => {
-      if (stompClient.current) {
-        stompClient.current.disconnect(() => {
-          console.log("Disconnected from WebSocket");
-        });
-      }
-    };
-  }, [activeChat]);
-    
+  // Handle Emoji Select
+  const handleEmojiSelect = (emoji) => {
+    setInputValue((prev) => prev + emoji.native);
+    setShowEmojiPicker(false);
+  };
+
+  // Placeholder Functions for Calls
+  const handleStartCall = async () => {
+    // Implement call logic here
+    console.log("Starting voice call...");
+    setIsCalling(true);
+  };
+
+  const handleVideoCall = () => {
+    // Implement video call logic here
+    console.log("Starting video call...");
+    setIsCalling(true);
+  };
+
+  const handleEndCall = () => {
+    // Implement end call logic here
+    console.log("Ending call...");
+    setIsCalling(false);
+  };
+
+  // Handle Setting Active Chat
+  const handleSetActiveChat = (conversationId) => {
+    setActiveChat(conversationId);
+  };
 
   return (
     <div style={{ height: "35.7rem" }} className="rounded-lg -ml-2.5">
       <div className="bg-white dark:bg-gray-900 flex h-full rounded-lg">
         {/* Sidebar */}
         <aside className="w-1/4 bg-white dark:bg-gray-800 shadow-lg flex flex-col">
+          {/* Header */}
           <header className="p-2 bg-white dark:bg-gray-800 flex items-center justify-between shadow">
             <div>
               <h2 className="text-lg font-semibold text-gray-800 dark:text-gray-100">
@@ -409,7 +422,7 @@ const Chat = () => {
                 />
                 {searchTerm && (
                   <ul className="absolute left-0 right-0 bg-white shadow rounded z-10 max-h-60 overflow-y-auto">
-                    {results
+                    {searchResults
                       .filter((user) =>
                         `${user.firstName} ${user.lastName}`
                           .toLowerCase()
@@ -429,7 +442,7 @@ const Chat = () => {
                           </span>
                         </li>
                       ))}
-                    {results.length === 0 && (
+                    {searchResults.length === 0 && (
                       <li className="p-1 text-gray-500">No users found</li>
                     )}
                   </ul>
@@ -437,11 +450,12 @@ const Chat = () => {
               </div>
             </div>
           </header>
+          {/* Chat List */}
           <div className="flex-1 overflow-y-auto">
             {chatList.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full text-center p-4">
                 <img
-                  src={BeginChatSvg} // Use the imported SVG
+                  src={BeginChatSvg}
                   alt="No chats"
                   className="w-32 h-32 mb-4"
                 />
@@ -453,7 +467,7 @@ const Chat = () => {
               chatList.map((chat) => (
                 <div
                   key={chat.id}
-                  onClick={() => setActiveChat(chat.id)}
+                  onClick={() => handleSetActiveChat(chat.id)}
                   className={`p-4 flex items-center gap-3 cursor-pointer transition-colors ${
                     activeChat === chat.id
                       ? "bg-gray-200 dark:bg-gray-700"
@@ -471,6 +485,12 @@ const Chat = () => {
                       {chat.lastMessage}
                     </p>
                   </div>
+                  {/* Unread Count Badge */}
+                  {chat.unreadCount > 0 && (
+                    <span className="inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-white bg-red-600 rounded-full">
+                      {chat.unreadCount}
+                    </span>
+                  )}
                   <p className="text-xs text-gray-400">{chat.time}</p>
                 </div>
               ))
@@ -495,7 +515,7 @@ const Chat = () => {
               </p>
             </div>
             <div className="flex items-center gap-4">
-              {/* Conditionally render call buttons only when a chat is active */}
+              {/* Call Buttons */}
               {activeChat && (
                 <>
                   <button
@@ -530,16 +550,13 @@ const Chat = () => {
             </div>
           </header>
           {/* Messages */}
-          <div
-            ref={messagesContainerRef}
-            className="flex-1 overflow-y-auto p-4 bg-gray-50 dark:bg-gray-900 flex flex-col items-center justify-center"
-          >
+          <div className="flex-1 overflow-y-auto p-4 bg-gray-50 dark:bg-gray-900 flex flex-col">
             {!activeChat ? (
               <div className="text-center flex flex-col items-center justify-center">
                 <img
-                  src={BeginChatSvg} // Replace with your image path
+                  src={BeginChatSvg}
                   alt="Start conversation"
-                  className="w-64 h-64 mb-4 items-center "
+                  className="w-64 h-64 mb-4"
                 />
                 <p className="text-gray-500 text-lg">
                   You are ready to start a conversation. Select a chat or search
@@ -553,25 +570,21 @@ const Chat = () => {
                 <div className="space-y-3 flex flex-col">
                   {messages.map((msg, index) => (
                     <div
-                      key={index}
+                      key={msg.id || msg.tempId || index}
                       className={`p-3 rounded-lg max-w-xs shadow-md ${
-                        msg.sender ===
-                        JSON.parse(localStorage.getItem("response_data")).users
-                          .id
+                        msg.sender === userId
                           ? "bg-blue-500 text-white self-end"
                           : "bg-gray-200 text-gray-800 dark:bg-gray-700 dark:text-gray-200 self-start"
                       }`}
                     >
                       {msg.content}
-                      {msg.sender ===
-                        JSON.parse(localStorage.getItem("response_data")).users
-                          .id && (
+                      {msg.sender === userId && (
                         <div className="text-xs mt-1">
-                          {msg.status === "sending" && <span>Sending...</span>}
-                          {msg.status === "sent" && <span>Sent</span>}
-                          {msg.status === "failed" && (
-                            <span className="text-red-500">Failed to send</span>
-                          )}
+                          {msg.status === "SENDING" && <span>Sending...</span>}
+                          {msg.status === "SENT" && <span>Sent</span>}
+                          {msg.status === "DELIVERED" && <span>Delivered</span>}
+                          {msg.status === "READ" && <span>Read</span>}
+                          {!msg.status && <span>Sent</span>}
                         </div>
                       )}
                     </div>
@@ -586,7 +599,6 @@ const Chat = () => {
               </div>
             )}
           </div>
-
           {/* Input Area */}
           {activeChat && (
             <div className="p-4 bg-white dark:bg-gray-800 flex items-center gap-3 shadow-lg relative">
@@ -603,10 +615,7 @@ const Chat = () => {
                 >
                   <Picker
                     data={data}
-                    onEmojiSelect={(emoji) => {
-                      setInputValue((prev) => prev + emoji.native);
-                      setShowEmojiPicker(false);
-                    }}
+                    onEmojiSelect={handleEmojiSelect}
                     theme={
                       localStorage.getItem("darkMode") === "true"
                         ? "dark"
@@ -666,6 +675,13 @@ const Chat = () => {
           )}
         </main>
       </div>
+      {/* Notification */}
+      {notification.visible && (
+        <Notification
+          message={notification.message}
+          onClose={hideNotification}
+        />
+      )}
     </div>
   );
 };
