@@ -361,9 +361,7 @@ const Chat = () => {
   const stompClient = useRef(null);
   useEffect(() => {
     const connectWebSocket = () => {
-      const sock = new SockJS("http://localhost:8088/ws", null, {
-        transports: ["websocket", "xhr-streaming", "xhr-polling"],
-      });
+      const sock = new SockJS("http://localhost:8088/ws");
       stompClient.current = Stomp.over(sock);
       stompClient.current.connect({}, () => {
         console.log("Connected to WebSocket");
@@ -373,20 +371,23 @@ const Chat = () => {
             (message) => {
               const newMessage = JSON.parse(message.body);
               setMessages((prevMessages) => [...prevMessages, newMessage]);
-            },
+            }
           );
         }
       });
     };
-
+  
     connectWebSocket();
-
+  
     return () => {
       if (stompClient.current) {
-        stompClient.current.disconnect();
+        stompClient.current.disconnect(() => {
+          console.log("Disconnected from WebSocket");
+        });
       }
     };
   }, [activeChat]);
+    
 
   return (
     <div style={{ height: "35.7rem" }} className="rounded-lg -ml-2.5">
